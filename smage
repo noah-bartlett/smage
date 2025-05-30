@@ -1,0 +1,212 @@
+#!/bin/bash
+
+set -euo pipefail
+
+SNAPSHOT_DIR="/.snapshots"
+declare -A SUBVOLS=(
+    ["home"]="/home"
+    ["pkg"]="/var/cache/pacman/pkg"
+    ["root"]="/"
+)
+
+timestamp=$(date +"%Y-%m-%d-%H-%M-%S")
+target="home"
+all=false
+
+usage() {
+    echo "Usage: smage [-c|-l|-d <name>|-r <name>|--cleanup <count>] [--home|-p|-r|-a]"
+    echo ""
+    echo "  -c                   Create snapshot (default: home)"
+    echo "  -l                   List snapshots"
+    echo "  -d <name>            Delete snapshot by name"
+    echo "  -r <name>            Rollback to snapshot (confirmation required)"
+    echo "  --cleanup <count>    Keep only <count> latest snapshots per subvolume"
+    echo ""
+    echo "  --home               Target @home (optional with -c)"
+    echo "  -p                   Target @pkg"
+    echo "  -r                   Target @ (root)"
+    echo "  -a, --all            Target all subvolumes"
+    echo "  -h                   Show this help"
+    exit 1
+}
+
+create_snapshot() {
+    if $all; then
+        for vol in "${!SUBVOLS[@]}"; do
+            local subvol_path=${SUBVOLS[$vol]}
+            local snapshot_name="$timestamp-$vol"
+            local snapshot_path="$SNAPSHOT_DIR/$snapshot_name"
+
+            echo "Creating snapshot of $subvol_path at $snapshot_path..."
+            sudo btrfs subvolume snapshot -r "$subvol_path" "$snapshot_path"
+        done
+        echo "All snapshots created."
+    else
+        local subvol_path=${SUBVOLS[$target]}
+        local snapshot_name="$timestamp-$target"
+        local snapshot_path="$SNAPSHOT_DIR/$snapshot_name"
+
+        echo "Creating snapshot of $subvol_path at $snapshot_path..."
+        sudo btrfs subvolume snapshot -r "$subvol_path" "$snapshot_path"
+        echo "Snapshot created: $snapshot_name"
+    fi
+}
+
+list_snapshots() {
+    echo "Available snapshots in $SNAPSHOT_DIR:"
+    ls -1 "$SNAPSHOT_DIR"
+}
+
+delete_snapshot() {
+    local name="$1"
+    local snapshot_path="$SNAPSHOT_DIR/$name"
+    if [[ -d "$snapshot_path" ]]; then
+        echo "Deleting snapshot: $name"
+        sudo btrfs subvolume delete "$snapshot_path"
+        echo "Deleted: $name"
+    else
+        echo "Snapshot not found: $name"
+    fi
+}
+
+rollback_snapshot() {
+    local name="$1"
+    local snapshot_path="$SNAPSHOT_DIR/$name"
+
+    if [[ ! -d "$snapshot_path" ]]; then
+        echo "Snapshot not found: $name"
+        exit 1
+    fi
+
+    local subvol=$(echo "$name" | awk -F- '{print $7}')
+    local subvol_path=${SUBVOLS[$subvol]:-}
+    if [[ -z "$subvol_path" ]]; then
+        echo "Could not determine subvolume from snapshot name: $name"
+        exit 1
+    fi
+
+    echo "WARNING: This will rollback $subvol_path to $name. Existing data will be lost."
+    read -p "Type 'yes' to confirm: " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        echo "Aborted."
+        exit 1
+    fi
+
+    echo "Rolling back $subvol_path to $snapshot_path..."
+    sudo mount --make-rprivate /
+    sudo btrfs subvolume delete "$subvol_path"
+    sudo btrfs subvolume snapshot "$snapshot_path" "$subvol_path"
+    echo "Rollback complete."
+}
+
+cleanup_snapshots() {
+    local dry_run="$1"  # Optional: pass 'dry' to preview deletions
+    local now
+    now=$(date +%s)
+
+    echo "Cleaning up snapshots based on age-based policy..."
+
+    for vol in "${!SUBVOLS[@]}"; do
+        echo "Processing snapshots for $vol..."
+
+        # Find snapshots for this subvolume
+        mapfile -t snapshots < <(
+            find "$SNAPSHOT_DIR" -maxdepth 1 -type d -printf '%f\n' |
+            grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-'"$vol"'$' |
+            sort
+        )
+
+        # Track kept snapshots by (time_bucket + type)
+        declare -A kept=()
+        declare -a deletions=()
+
+        for snap in "${snapshots[@]}"; do
+            ts_part="${snap%-${vol}}"  # Strip the -subvol suffix
+            type="$vol"
+            snap_date=$(date -d "${ts_part//-/ }" +%s 2>/dev/null)
+            [[ -z "$snap_date" ]] && { echo "  Skipping invalid date: $snap"; continue; }
+
+            age_days=$(( (now - snap_date) / 86400 ))
+            year=$(date -d "@$snap_date" +%Y)
+            month=$(date -d "@$snap_date" +%Y-%m)
+            day=$(date -d "@$snap_date" +%Y-%m-%d)
+
+            # Define the time bucket key
+            if (( age_days > 365 )); then
+                time_bucket="$year"
+            elif (( age_days > 180 )); then
+                time_bucket="$year-$(printf '%02d' $(( (10#$(date -d "@$snap_date" +%m) - 1) / 2 * 2 + 1 )))"
+            elif (( age_days > 30 )); then
+                time_bucket="$month"
+            else
+                time_bucket="$day"
+            fi
+
+            # Combine time bucket + type for deduplication
+            keep_key="${time_bucket}_${type}"
+
+            if [[ -z "${kept[$keep_key]}" ]]; then
+                kept[$keep_key]="$snap"
+            else
+                deletions+=("$snap")
+            fi
+        done
+
+        # Perform deletions
+        if ((${#deletions[@]} == 0)); then
+            echo "  Nothing to delete for $vol."
+        else
+            echo "  Deleting ${#deletions[@]} snapshots for $vol..."
+            for target in "${deletions[@]}"; do
+                path="$SNAPSHOT_DIR/$target"
+                if [[ "$dry_run" == "dry" ]]; then
+                    echo "  [DRY RUN] Would delete: $path"
+                else
+                    echo "  Deleting: $path"
+                    sudo btrfs subvolume delete "$path" || echo "  Warning: Failed to delete $path"
+                fi
+            done
+        fi
+
+        unset kept deletions
+    done
+
+    echo "Cleanup complete."
+}
+
+# Argument parsing
+if [[ $# -eq 0 ]]; then usage; fi
+
+action=""
+cleanup_count=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c) action="create" ;;
+        -l) action="list" ;;
+        -d) action="delete"; shift; snap_name="$1" ;;
+        -r)
+            if [[ -n "${action:-}" && "${action}" != "rollback" ]]; then
+                target="root"
+            else
+                action="rollback"; shift; snap_name="$1"
+            fi
+            ;;
+        -p) target="pkg" ;;
+        --home) target="home" ;;
+        -a|--all) all=true ;;
+        --cleanup) action="cleanup" ;;
+        -h) usage ;;
+        *) echo "Unknown option: $1"; usage ;;
+    esac
+    shift
+done
+
+# Execute action
+case "$action" in
+    create) create_snapshot ;;
+    list) list_snapshots ;;
+    delete) delete_snapshot "$snap_name" ;;
+    rollback) rollback_snapshot "$snap_name" ;;
+    cleanup) cleanup_snapshots "$cleanup_count" ;;
+    *) usage ;;
+esac
